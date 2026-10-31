@@ -4,22 +4,25 @@ buildscript {
   repositories {
     // Use 'gradle install' to install latest
     mavenLocal()
-    jcenter()
+    gradlePluginPortal()
   }
 
   dependencies {
-    classpath("com.github.ben-manes:gradle-versions-plugin:+")
+    classpath("io.github.ben-manes:gradle-versions-plugin:+")
   }
 }
 
-apply(plugin = "com.github.ben-manes.versions")
+// Selects between the jre and android variants that guava 32.1.0 and later publish
+apply(plugin = "jvm-ecosystem")
+apply(plugin = "io.github.ben-manes.versions")
 
 repositories {
-  jcenter()
+  mavenCentral()
 }
 
 configurations {
   register("bom")
+  register("bounded")
   register("upToDate")
   register("exceedLatest")
   register("platform")
@@ -30,13 +33,13 @@ configurations {
 }
 
 fun String.isNonStable(): Boolean {
-  val stableKeyword = listOf("RELEASE", "FINAL", "GA").any { toUpperCase().contains(it) }
-  val regex = "^[0-9,.v-]+(-r)?$".toRegex()
+  val stableKeyword = listOf("RELEASE", "FINAL", "GA").any { uppercase().contains(it) }
+  val regex = "^[0-9,.v-]+(-r|-jre|-android)?$".toRegex()
   val isStable = stableKeyword || regex.matches(this)
   return isStable.not()
 }
 
-tasks.withType<DependencyUpdatesTask> {
+tasks.named<DependencyUpdatesTask>("dependencyUpdates") {
 
   // Example 1: reject all non stable versions
   rejectVersionIf {
@@ -59,8 +62,22 @@ tasks.withType<DependencyUpdatesTask> {
     }
   }
 
+  // Example 4: disallow candidates less mature than the current version
+  val qualifiers = listOf("preview", "alpha", "beta", "m", "cr", "rc") // order is important
+  fun maturityLevel(version: String): Int {
+    val index = qualifiers.indexOfFirst {
+      version.matches(".*[.\\-]$it[.\\-\\d]*".toRegex(RegexOption.IGNORE_CASE))
+    }
+    return if (index < 0) qualifiers.size else index
+  }
+  rejectVersionIf {
+    maturityLevel(candidate.version) < maturityLevel(currentVersion)
+  }
+
   // optional parameters
   checkForGradleUpdate = true
+  rejectOutOfBounds = true
+  rejectPreReleases = false
   outputFormatter = "json"
   outputDir = "build/dependencyUpdates"
   reportfileName = "report"
@@ -70,6 +87,11 @@ dependencies {
   "bom"("org.springframework.boot:spring-boot-dependencies:1.5.8.RELEASE")
   "bom"("com.google.code.gson:gson")
   "bom"("dom4j:dom4j")
+  "bounded"("com.google.code.gson:gson") {
+    version {
+      strictly("[2.8, 2.11[")
+    }
+  }
   "upToDate"("backport-util-concurrent:backport-util-concurrent:3.1")
   "upToDate"("backport-util-concurrent:backport-util-concurrent-java12:3.1")
   "exceedLatest"("com.google.guava:guava:99.0-SNAPSHOT")

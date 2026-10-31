@@ -1,0 +1,289 @@
+package com.github.benmanes.gradle.versions.reporter
+
+import com.github.benmanes.gradle.versions.reporter.result.Dependency
+import com.github.benmanes.gradle.versions.reporter.result.DependencyOutdated
+import com.github.benmanes.gradle.versions.reporter.result.Result
+import com.github.benmanes.gradle.versions.updates.VersionMapping
+import com.github.benmanes.gradle.versions.updates.gradle.GradleReleaseChannel.CURRENT
+import com.github.benmanes.gradle.versions.updates.gradle.GradleReleaseChannel.NIGHTLY
+import com.github.benmanes.gradle.versions.updates.gradle.GradleReleaseChannel.RELEASE_CANDIDATE
+import org.gradle.api.Project
+import org.gradle.api.logging.Logging
+import java.io.OutputStream
+
+/**
+ * A plain text reporter for the dependency updates results.
+ *
+ * @property isInfoEnabled Whether the build already runs at the info level, so that the report does
+ * not suggest enabling it. Read from Gradle's logging where it is not passed.
+ */
+class PlainTextReporter
+  @JvmOverloads
+  constructor(
+    override val projectPath: String,
+    override val revision: String,
+    override val gradleReleaseChannel: String,
+    private val isInfoEnabled: Boolean = Logging.getLogger(PlainTextReporter::class.java).isInfoEnabled,
+  ) : AbstractReporter(projectPath, revision, gradleReleaseChannel) {
+    @Deprecated(
+      "Use the constructor that takes the project's path.",
+      ReplaceWith("PlainTextReporter(project.path, revision, gradleReleaseChannel)"),
+    )
+    constructor(
+      project: Project,
+      revision: String,
+      gradleReleaseChannel: String,
+    ) : this(project.path, revision, gradleReleaseChannel)
+
+    // One comparator for the report, rather than one per row: the parser behind it caches every
+    // version string it reads, for the life of the report.
+    private val versionComparator = VersionMapping.versionComparator()
+
+    /** Writes the report to the print stream. The stream is not automatically closed. */
+    override fun write(
+      printStream: OutputStream,
+      result: Result,
+    ) {
+      writeHeader(printStream)
+
+      if (result.count == 0) {
+        printStream.println()
+        printStream.println("No dependencies found.")
+      } else {
+        writeUpToDate(printStream, result)
+        writeExceedLatestFound(printStream, result)
+        writeUpgrades(printStream, result)
+        writeUndeclared(printStream, result)
+        writeUnresolved(printStream, result)
+      }
+
+      writeLeftOutEmbeddedKotlin(printStream, result)
+      writeSkipped(printStream, result)
+      writeGradleUpdates(printStream, result)
+    }
+
+    override fun getFileExtension(): String = "txt"
+
+    private fun writeHeader(printStream: OutputStream) {
+      printStream.println()
+      printStream.println("------------------------------------------------------------")
+      printStream.println("$projectPath Project Dependency Updates (report to plain text file)")
+      printStream.println("------------------------------------------------------------")
+    }
+
+    private fun writeUpToDate(
+      printStream: OutputStream,
+      result: Result,
+    ) {
+      val upToDateVersions = result.current.dependencies
+      if (upToDateVersions.isNotEmpty()) {
+        printStream.println()
+        printStream.println("The following dependencies are using the latest $revision version:")
+        for (dependency in upToDateVersions) {
+          printStream.println(" - ${label(dependency)}:${dependency.version}")
+          dependency.userReason?.let {
+            printStream.println("     $it")
+          }
+          sourceLabel(dependency)?.let {
+            printStream.println("     $it")
+          }
+        }
+      }
+    }
+
+    private fun writeExceedLatestFound(
+      printStream: OutputStream,
+      result: Result,
+    ) {
+      val downgradeVersions = result.exceeded.dependencies
+      if (downgradeVersions.isNotEmpty()) {
+        printStream.println()
+        printStream.println(
+          "The following dependencies exceed the version found at the $revision revision level:",
+        )
+        for (dependency in downgradeVersions) {
+          val currentVersion = dependency.version
+          printStream.println(" - ${label(dependency)} [$currentVersion <- ${dependency.latest}]")
+          dependency.userReason?.let {
+            printStream.println("     $it")
+          }
+          dependency.projectUrl?.let {
+            printStream.println("     $it")
+          }
+          sourceLabel(dependency)?.let {
+            printStream.println("     $it")
+          }
+        }
+      }
+    }
+
+    /** Returns the row's version steps joined by arrows. */
+    private fun breadcrumb(dependency: DependencyOutdated): String =
+      laterSteps(dependency, revision, versionComparator).joinToString(" -> ")
+
+    private fun writeUpgrades(
+      printStream: OutputStream,
+      result: Result,
+    ) {
+      val upgradeVersions = result.outdated.dependencies
+      if (upgradeVersions.isNotEmpty()) {
+        printStream.println()
+        printStream.println("The following dependencies have later $revision versions:")
+        for (dependency in upgradeVersions) {
+          val currentVersion = dependency.version
+          printStream.println(" - ${label(dependency)} [${breadcrumb(dependency)}]")
+          dependency.userReason?.let {
+            printStream.println("     $it")
+          }
+          dependency.projectUrl?.let {
+            printStream.println("     $it")
+          }
+          sourceLabel(dependency)?.let {
+            printStream.println("     $it")
+          }
+        }
+      }
+    }
+
+    private fun writeUndeclared(
+      printStream: OutputStream,
+      result: Result,
+    ) {
+      val undeclaredVersions = result.undeclared.dependencies
+      if (undeclaredVersions.isNotEmpty()) {
+        printStream.println()
+        printStream.println(
+          "Failed to compare versions for the following dependencies because they were declared without version:",
+        )
+        for (dependency in undeclaredVersions) {
+          printStream.println(" - ${label(dependency)}")
+        }
+      }
+    }
+
+    private fun writeUnresolved(
+      printStream: OutputStream,
+      result: Result,
+    ) {
+      val unresolved = result.unresolved.dependencies
+      if (unresolved.isNotEmpty()) {
+        val hint = if (isInfoEnabled) "" else " (use --info for details)"
+        printStream.println()
+        printStream.println(
+          "Failed to determine the latest version for the following dependencies$hint:",
+        )
+        for (dependency in unresolved) {
+          val version = dependency.version
+          val versionSuffix = if (version.isNullOrEmpty() || version == "none") "" else ":$version"
+          printStream.println(" - ${label(dependency)}$versionSuffix")
+          // The resolver's account of the failure, which covers causes the coordinate alone
+          // cannot show. A build with no repositories declared reports every coordinate here, and
+          // until this line was printed the report showed no reason why. Printed as the first line
+          // alone, as a skipped configuration's reason is, since the rest is a stack trace.
+          dependency.reason.lineSequence().first().takeIf { it.isNotBlank() }?.let {
+            printStream.println("     $it")
+          }
+          dependency.userReason?.let {
+            printStream.println("     $it")
+          }
+          dependency.projectUrl?.let {
+            printStream.println("     $it")
+          }
+        }
+      }
+    }
+
+    private fun writeLeftOutEmbeddedKotlin(
+      printStream: OutputStream,
+      result: Result,
+    ) {
+      leftOutEmbeddedKotlinLabel(result.leftOutEmbeddedKotlin)?.let {
+        printStream.println()
+        printStream.println(it)
+      }
+    }
+
+    private fun writeSkipped(
+      printStream: OutputStream,
+      result: Result,
+    ) {
+      val skipped = result.skipped.configurations
+      if (skipped.isNotEmpty()) {
+        val hint = if (isInfoEnabled) "" else " (use --info for details)"
+        printStream.println()
+        printStream.println(
+          "Failed to inspect the dependencies of the following configurations$hint:",
+        )
+        for ((reason, group) in skipped.groupBy { it.reason }) {
+          printStream.println(" - " + reason.lineSequence().first())
+          for (configuration in group) {
+            printStream.println("     '${configuration.name}' in ${projectsLabel(listOf(configuration.project))}")
+          }
+        }
+      }
+    }
+
+    private fun writeGradleUpdates(
+      printStream: OutputStream,
+      result: Result,
+    ) {
+      if (!result.gradle.enabled) {
+        return
+      }
+
+      printStream.println()
+      printStream.println("Gradle $gradleReleaseChannel updates:")
+      // Log Gradle update checking failures.
+      if (result.gradle.current.isFailure) {
+        printStream
+          .println("[ERROR] [release channel: ${CURRENT.id}] " + result.gradle.current.reason)
+      }
+      if ((gradleReleaseChannel == RELEASE_CANDIDATE.id || gradleReleaseChannel == NIGHTLY.id) &&
+        result.gradle.releaseCandidate.isFailure
+      ) {
+        printStream
+          .println(
+            "[ERROR] [release channel: ${RELEASE_CANDIDATE.id}] " +
+              result
+                .gradle.releaseCandidate.reason,
+          )
+      }
+      if (gradleReleaseChannel == NIGHTLY.id && result.gradle.nightly.isFailure) {
+        printStream
+          .println("[ERROR] [release channel: ${NIGHTLY.id}] " + result.gradle.nightly.reason)
+      }
+
+      // print Gradle updates in breadcrumb format
+      printStream.print(" - Gradle: [" + result.gradle.running.version)
+      var updatePrinted = false
+      if (result.gradle.current.isUpdateAvailable && result.gradle.current > result.gradle.running) {
+        updatePrinted = true
+        printStream.print(" -> " + result.gradle.current.version)
+      }
+      if ((gradleReleaseChannel == RELEASE_CANDIDATE.id || gradleReleaseChannel == NIGHTLY.id) &&
+        result.gradle.releaseCandidate.isUpdateAvailable &&
+        result.gradle.releaseCandidate >
+        result.gradle.current
+      ) {
+        updatePrinted = true
+        printStream.print(" -> " + result.gradle.releaseCandidate.version)
+      }
+      if (gradleReleaseChannel == NIGHTLY.id &&
+        result.gradle.nightly.isUpdateAvailable &&
+        result.gradle.nightly >
+        result.gradle.current
+      ) {
+        updatePrinted = true
+        printStream.print(" -> " + result.gradle.nightly.version)
+      }
+      if (!updatePrinted) {
+        printStream.print(": UP-TO-DATE")
+      }
+      printStream.println("]")
+    }
+
+    companion object {
+      /** Returns the dependency key as a stringified label. */
+      private fun label(dependency: Dependency): String = "${dependency.group.orEmpty()}:${dependency.name}"
+    }
+  }

@@ -1,0 +1,118 @@
+package com.github.benmanes.gradle.versions.reporter
+
+import com.github.benmanes.gradle.versions.reporter.result.Dependency
+import java.io.OutputStream
+import java.io.PrintStream
+
+/**
+ * A base result object reporter for the dependency updates results.
+ *
+ * @property projectPath The build tree path of the project evaluated against.
+ * @property revision The revision strategy evaluated with.
+ * @property gradleReleaseChannel The gradle release channel to use for reporting.
+ */
+abstract class AbstractReporter(
+  open val projectPath: String,
+  open val revision: String,
+  open val gradleReleaseChannel: String,
+) : Reporter
+
+fun OutputStream.print(s: String = "") {
+  (this as PrintStream).print(s)
+}
+
+fun OutputStream.println(s: String = "") {
+  (this as PrintStream).println(s)
+}
+
+/** Returns the line for the entries left out for Gradle's embedded Kotlin, or null where there are none. */
+internal fun leftOutEmbeddedKotlinLabel(count: Int): String? {
+  if (count <= 0) {
+    return null
+  }
+  val entries = if (count == 1) "entry" else "entries"
+  val verb = if (count == 1) "was" else "were"
+  val them = if (count == 1) "it" else "them"
+  return "$count $entries set by Gradle's embedded Kotlin $verb left out. " +
+    "Run with --check-embedded-kotlin to see $them."
+}
+
+/** The number of names listed before a long list is elided in the human readable reports. */
+private const val MAX_LISTED_NAMES = 5
+
+/** Returns the display list of names, eliding all but the first few of a long list. */
+private fun elidedLabel(names: List<String>): String =
+  if (names.size <= MAX_LISTED_NAMES + 1) {
+    names.joinToString(", ")
+  } else {
+    names.take(MAX_LISTED_NAMES).joinToString(", ") + " and ${names.size - MAX_LISTED_NAMES} others"
+  }
+
+/**
+ * Returns the display list of the projects that declared a divergent version, eliding all but the
+ * first few of a long list.
+ */
+internal fun projectsLabel(projects: List<String>): String = elidedLabel(projects.map { if (it == ":") "root project" else it })
+
+/** Returns the display list of the configurations a dependency was declared against. */
+private fun configurationsLabel(names: List<String>): String {
+  val quoted = names.map { "'$it'" }
+  val listed =
+    if (quoted.size <= MAX_LISTED_NAMES + 1) {
+      if (quoted.size == 1) {
+        quoted.single()
+      } else {
+        quoted.dropLast(1).joinToString(", ") + " and ${quoted.last()}"
+      }
+    } else {
+      quoted.take(MAX_LISTED_NAMES).joinToString(", ") + " and ${quoted.size - MAX_LISTED_NAMES} more"
+    }
+  val noun = if (names.size == 1) "configuration" else "configurations"
+  return "the $listed $noun"
+}
+
+/**
+ * Returns the line describing where the dependency's version came from, or null for a declared one.
+ *
+ * At most one attribution line is printed under a row. The order below decides which one, nearest
+ * cause first: the platform a row was imported through comes before the platform that constrains
+ * it, then a declaration, then the plugin that contributed it. Only a module declared without a
+ * version can be constrained by a platform, so a declaration displaced by that line would point at
+ * a spot in the build script with no version in it. Which line a row qualifies for is decided where
+ * the statuses are assembled; the order below settles only which one wins. The [projects] default to
+ * the dependency's own, which a row of the file reports lists only for a divergent version.
+ */
+internal fun sourceLabel(
+  dependency: Dependency,
+  projects: List<String>? = dependency.projects,
+): String? {
+  val platforms = dependency.platformProjects?.takeIf { it.isNotEmpty() }
+  if (platforms != null) {
+    val noun = if (platforms.size == 1) "platform" else "platforms"
+    val imported = "imported by the $noun ${projectsLabel(platforms)}"
+    return if (projects == null) imported else "$imported in ${projectsLabel(projects)}"
+  }
+  val bounding = dependency.constrainedBy?.takeIf { it.isNotEmpty() }
+  if (bounding != null) {
+    val noun = if (bounding.size == 1) "platform" else "platforms"
+    val constrained = "constrained by the $noun ${projectsLabel(bounding)}"
+    return if (projects == null) constrained else "$constrained in ${projectsLabel(projects)}"
+  }
+  val names = dependency.configurations?.takeIf { it.isNotEmpty() }
+  if (dependency.contributed != true) {
+    // A configuration is named only when the dependency was declared directly against a resolvable
+    // one, which is how a plugin adding its own classpath eagerly leaves it.
+    val where = names?.let { "declared in ${configurationsLabel(it)}" }
+    return when {
+      where == null -> projects?.let { "declared in ${projectsLabel(it)}" }
+      projects == null -> where
+      else -> "$where in ${projectsLabel(projects)}"
+    }
+  }
+  val into = names?.let { " into ${configurationsLabel(it)}" }.orEmpty()
+  return if (projects == null) {
+    "contributed by a plugin$into"
+  } else {
+    "contributed by a plugin$into in ${projectsLabel(projects)}"
+  }
+}

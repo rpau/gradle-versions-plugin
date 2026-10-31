@@ -1,0 +1,297 @@
+package com.github.benmanes.gradle.versions
+
+import static org.gradle.testkit.runner.TaskOutcome.SUCCESS
+
+import groovy.json.JsonSlurper
+import org.gradle.testkit.runner.GradleRunner
+import org.junit.Rule
+import org.junit.rules.TemporaryFolder
+import spock.lang.Specification
+
+/**
+ * Pins three settings-plumbing gaps in the aggregation topology's per-project parameter
+ * resolution ({@code Aggregation.kt}). Kept separate from {@link AggregationSpec}, which covers
+ * the topology's wiring and result correctness rather than its settings resolution.
+ */
+final class AggregationSettingsSpec extends Specification {
+  @Rule final TemporaryFolder testProjectDir = new TemporaryFolder()
+  private String mavenRepoUrl
+
+  def 'setup'() {
+    mavenRepoUrl = getClass().getResource('/maven/').toURI()
+    testProjectDir.newFile('settings.gradle') << "include 'app', 'lib'"
+    testProjectDir.newFile('build.gradle') <<
+      """
+        plugins {
+          id 'io.github.ben-manes.versions'
+        }
+
+        allprojects {
+          apply plugin: 'java'
+
+          repositories {
+            maven {
+              url '${mavenRepoUrl}'
+            }
+          }
+        }
+      """.stripIndent()
+    testProjectDir.newFolder('app')
+    testProjectDir.newFile('app/build.gradle') <<
+      """
+        dependencies {
+          implementation 'com.google.inject:guice:2.0'
+        }
+      """.stripIndent()
+    testProjectDir.newFolder('lib')
+    testProjectDir.newFile('lib/build.gradle') <<
+      """
+        dependencies {
+          implementation 'com.google.guava:guava:15.0'
+        }
+      """.stripIndent()
+  }
+
+  private def run(List<String> arguments) {
+    return TestKitRunner.create()
+      .withProjectDir(testProjectDir.root)
+      .withArguments(arguments)
+      .withPluginClasspath()
+      .build()
+  }
+
+  def 'Honors dependencyUpdates configuration added from the root build script own afterEvaluate'() {
+    // The plugin's own project.afterEvaluate (which realizes the task for the per-project
+    // producers) is registered during `apply`, before the root build script body runs. A root
+    // afterEvaluate written in the build script therefore registers, and so also runs, after it,
+    // so the producers must read the settings as last configured rather than as first realized.
+    given:
+    new File(testProjectDir.root, 'build.gradle') <<
+      """
+        afterEvaluate {
+          tasks.named('dependencyUpdates').configure {
+            rejectVersionIf {
+              it.candidate.version.startsWith('16.')
+            }
+          }
+        }
+      """.stripIndent()
+
+    when:
+    def result = run(['dependencyUpdates', '-DoutputFormatter=json', '--no-parallel'])
+    def report = new JsonSlurper()
+      .parse(new File(testProjectDir.root, 'build/dependencyUpdates/report.json'))
+
+    then:
+    result.task(':dependencyUpdates').outcome == SUCCESS
+    // The report holds guava at 15.0: the root afterEvaluate's rejectVersionIf reached it.
+    report.current.dependencies*.name.contains('guava')
+    !report.outdated.dependencies*.name.contains('guava')
+  }
+
+  def 'Honors an explicit subproject setting that equals the default over a non-default ancestor'() {
+    // DependencyUpdatesParameters.isDefault (Aggregation.kt) treats an explicitly-set value that
+    // happens to equal the default as "unconfigured". A subproject that explicitly opts out of a
+    // property an ancestor turned on must keep its own explicit value, not the ancestor's.
+    given:
+    new File(testProjectDir.root, 'build.gradle') <<
+      """
+        subprojects {
+          apply plugin: 'io.github.ben-manes.versions'
+        }
+
+        tasks.dependencyUpdates {
+          checkConstraints = true
+        }
+      """.stripIndent()
+    new File(testProjectDir.root, 'app/build.gradle') <<
+      """
+        dependencyUpdates {
+          checkConstraints = false
+        }
+
+        dependencies {
+          constraints {
+            implementation 'com.google.guava:guava:15.0'
+          }
+        }
+      """.stripIndent()
+
+    when:
+    def result = run([':app:dependencyUpdates', '--no-parallel'])
+
+    then:
+    result.task(':app:dependencyUpdates').outcome == SUCCESS
+    // app has no explicit guava dependency, only the constraint, so it must only appear if app's
+    // own checkConstraints = false is honored instead of falling back to the root's true.
+    !result.output.contains('com.google.guava:guava')
+  }
+
+  def 'Honors an ancestor setting the subproject never touched, alongside its own explicit override'() {
+    // DependencyUpdatesParametersService.resolve (Aggregation.kt) returns the nearest non-default
+    // ancestor's ENTIRE record. A subproject that sets one property must keep the root's value for
+    // every OTHER property it left untouched, not silently reset those to the framework defaults.
+    given:
+    new File(testProjectDir.root, 'build.gradle') <<
+      """
+        subprojects {
+          apply plugin: 'io.github.ben-manes.versions'
+        }
+
+        tasks.dependencyUpdates {
+          checkConstraints = true
+          rejectVersionIf {
+            it.candidate.version == '3.1'
+          }
+        }
+      """.stripIndent()
+    new File(testProjectDir.root, 'app/build.gradle') <<
+      """
+        dependencyUpdates {
+          rejectVersionIf {
+            it.candidate.version == '3.0'
+          }
+        }
+
+        dependencies {
+          constraints {
+            implementation 'com.google.guava:guava:15.0'
+          }
+        }
+      """.stripIndent()
+
+    when:
+    def result = run([':app:dependencyUpdates', '--no-parallel'])
+
+    then:
+    result.task(':app:dependencyUpdates').outcome == SUCCESS
+    // Half 1: app's own resolutionStrategy (rejecting 3.0) must win over the root's (rejecting
+    // 3.1) -- if the root's rejection applied instead, guice would cap at 3.0, not 3.1.
+    result.output.contains('com.google.inject:guice [2.0 -> 2.2 -> 3.1]')
+    // Half 2: app never touched checkConstraints, so it must still inherit the root's true --
+    // app has no explicit guava dependency, only the constraint.
+    result.output.contains('com.google.guava:guava')
+  }
+
+  def 'Reads back an assigned resolutionStrategy closure'() {
+    given:
+    new File(testProjectDir.root, 'build.gradle') <<
+      """
+        dependencyUpdates {
+          resolutionStrategy = {
+            componentSelection {
+              all { selection ->
+                if (selection.candidate.version == '3.1') {
+                  selection.reject('rejected')
+                }
+              }
+            }
+          }
+        }
+
+        tasks.register('readBack') {
+          def assigned = tasks.dependencyUpdates.resolutionStrategy != null
+          doLast {
+            println "readBack=\$assigned"
+          }
+        }
+      """.stripIndent()
+
+    when:
+    def result = run([':readBack', ':dependencyUpdates', '--no-parallel'])
+
+    then:
+    result.task(':dependencyUpdates').outcome == SUCCESS
+    // Assigning the property must not clear it, or build logic guarding on "did anyone configure
+    // this?" silently applies its own strategy over the user's.
+    result.output.contains('readBack=true')
+    result.output.contains('com.google.inject:guice [2.0 -> 2.2 -> 3.0]')
+  }
+
+  def 'Prints the inherited revision in the header of a subproject report'() {
+    // The getters fell back to the value configured on this project while the producers resolved
+    // with the nearest ancestor's, so the default revision level was printed in the header over
+    // rows that had been resolved at the inherited one.
+    given:
+    new File(testProjectDir.root, 'build.gradle') <<
+      """
+        subprojects {
+          apply plugin: 'io.github.ben-manes.versions'
+        }
+
+        tasks.dependencyUpdates {
+          revision = 'release'
+        }
+      """.stripIndent()
+
+    when:
+    def result = run([':app:dependencyUpdates', '--no-parallel'])
+
+    then:
+    result.task(':app:dependencyUpdates').outcome == SUCCESS
+    result.output.contains('The following dependencies have later release versions:')
+    !result.output.contains('The following dependencies have later milestone versions:')
+  }
+
+  def 'Reads back the inherited constraint checks in a subproject with none of its own'() {
+    // Neither check is visible in the report, so the getters are read back instead and compared
+    // against what the producers resolved with, which is what the two constrained rows show.
+    given:
+    new File(testProjectDir.root, 'build.gradle') <<
+      """
+        subprojects {
+          apply plugin: 'io.github.ben-manes.versions'
+        }
+
+        tasks.dependencyUpdates {
+          checkConstraints = true
+          checkBuildEnvironmentConstraints = true
+        }
+      """.stripIndent()
+    // Rewritten rather than appended to, as a buildscript block must come first in the script.
+    new File(testProjectDir.root, 'app/build.gradle').text =
+      """
+        buildscript {
+          repositories {
+            maven {
+              url '${mavenRepoUrl}'
+            }
+          }
+
+          dependencies {
+            constraints {
+              classpath 'backport-util-concurrent:backport-util-concurrent:1.0'
+            }
+          }
+        }
+
+        tasks.register('readBack') {
+          def checkConstraints = tasks.dependencyUpdates.checkConstraints
+          def checkBuildEnvironmentConstraints =
+            tasks.dependencyUpdates.checkBuildEnvironmentConstraints
+          doLast {
+            println "readBack=\$checkConstraints,\$checkBuildEnvironmentConstraints"
+          }
+        }
+
+        dependencies {
+          implementation 'com.google.inject:guice:2.0'
+          constraints {
+            implementation 'com.google.guava:guava:15.0'
+          }
+        }
+      """.stripIndent()
+
+    when:
+    def result = run([':app:readBack', ':app:dependencyUpdates', '--no-parallel'])
+
+    then:
+    result.task(':app:dependencyUpdates').outcome == SUCCESS
+    // guava is only a project constraint and backport-util-concurrent is only a buildscript one,
+    // so each row is printed only when its own inherited check applied. The getters must agree.
+    result.output.contains('com.google.guava:guava')
+    result.output.contains('backport-util-concurrent:backport-util-concurrent')
+    !result.output.contains('log4j-core')
+    result.output.contains('readBack=true,true')
+  }
+}

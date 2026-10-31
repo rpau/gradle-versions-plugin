@@ -1,0 +1,1023 @@
+/*
+ * Copyright 2012-2014 Ben Manes. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.github.benmanes.gradle.versions
+
+import com.github.benmanes.gradle.versions.updates.OutputFormatterArgument
+import org.gradle.api.Action
+
+import static com.github.benmanes.gradle.versions.updates.DependencyUpdatesReporterKt.reporterFor
+import static com.github.benmanes.gradle.versions.updates.gradle.GradleReleaseChannel.CURRENT
+import static com.github.benmanes.gradle.versions.updates.gradle.GradleReleaseChannel.RELEASE_CANDIDATE
+
+import com.github.benmanes.gradle.versions.reporter.Reporter
+import com.github.benmanes.gradle.versions.reporter.result.Result
+import com.github.benmanes.gradle.versions.updates.Coordinate
+import com.github.benmanes.gradle.versions.updates.PartialStatus
+import org.gradle.api.artifacts.ComponentSelection
+import com.github.benmanes.gradle.versions.updates.UnresolvedInfo
+import org.gradle.testfixtures.ProjectBuilder
+import spock.lang.Issue
+import spock.lang.Specification
+import spock.lang.Unroll
+
+/**
+ * A specification for the dependency updates task.
+ */
+final class DependencyUpdatesSpec extends Specification {
+
+  private static final String NONE_VERSION = 'none'
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/pull/994')
+  def 'Default outputDir stays absolute when the build directory is the project directory'() {
+    given:
+    def project = singleProject()
+    project.layout.buildDirectory.set(project.layout.projectDirectory)
+    project.pluginManager.apply('io.github.ben-manes.versions')
+
+    expect:
+    // An empty relative path would default the report to the filesystem root.
+    def outputDir = new File(project.tasks.getByName('dependencyUpdates').outputDir)
+    outputDir.canonicalPath.startsWith(project.projectDir.canonicalPath)
+  }
+
+  def 'Single project with no dependencies for many formats'() {
+    given:
+    def project = singleProject()
+
+    when:
+    def reporter = evaluate(project, 'milestone', 'json,xml')
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      upToDateVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      undeclared.isEmpty()
+    }
+  }
+
+  @Unroll
+  def 'Single project with no dependencies (#outputFormat)'() {
+    given:
+    def project = singleProject()
+
+    when:
+    def reporter = evaluate(project, 'milestone', outputFormat)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      upToDateVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      undeclared.isEmpty()
+    }
+
+    where:
+    outputFormat << ['plain', 'json', 'xml']
+  }
+
+  def 'Single project with no dependencies in invalid dir name'() {
+    given:
+    def project = singleProject()
+
+    when:
+    def reporter = evaluate(project, 'milestone', 'json', 'build/invalid dir')
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      upToDateVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      undeclared.isEmpty()
+    }
+  }
+
+  @Unroll
+  def 'Single project with no repositories (#outputFormat)'() {
+    given:
+    def project = singleProject()
+    addDependenciesTo(project)
+
+    when:
+    def reporter = evaluate(project, 'milestone', outputFormat)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.size() == 10
+      upgradeVersions.isEmpty()
+      upToDateVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      undeclared.isEmpty()
+    }
+
+    where:
+    outputFormat << ['plain', 'json', 'xml']
+  }
+
+  def 'Single project with a good and an empty repository'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    addEmptyRepositoryTo(project)
+    addDependenciesTo(project)
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    checkUnresolvedVersions(reporter)
+    checkUpgradeVersions(reporter)
+    checkUpToDateVersions(reporter)
+    checkDowngradeVersions(reporter)
+    checkUndeclaredVersions(reporter)
+  }
+
+  @Issue("https://github.com/ben-manes/gradle-versions-plugin/issues/592")
+  def 'Project configurations failOnDynamicVersions'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    addDependenciesTo(project)
+    project.configurations.configureEach {
+      resolutionStrategy {
+        failOnDynamicVersions()
+      }
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    checkUnresolvedVersions(reporter)
+    checkUpgradeVersions(reporter)
+    checkUpToDateVersions(reporter)
+    checkDowngradeVersions(reporter)
+    checkUndeclaredVersions(reporter)
+  }
+
+  @Unroll
+  def 'Single project (#revision, #outputFormat)'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    addDependenciesTo(project)
+
+    when:
+    def reporter = evaluate(project, revision, outputFormat)
+    reporter.write()
+
+    then:
+    checkUnresolvedVersions(reporter)
+    checkUpgradeVersions(reporter)
+    checkUpToDateVersions(reporter)
+    checkDowngradeVersions(reporter)
+    checkUndeclaredVersions(reporter)
+
+    where:
+    revision << ['release', 'milestone', 'integration']
+    outputFormat << ['plain', 'json', 'xml']
+  }
+
+  @Unroll
+  def 'Multi-project with dependencies on parent (#revision, #outputFormat)'() {
+    given:
+    //noinspection GroovyUnusedAssignment
+    def (rootProject, childProject) = multiProject()
+    addRepositoryTo(rootProject)
+    addDependenciesTo(rootProject)
+
+    when:
+    def reporter = evaluate(rootProject, revision, outputFormat)
+    reporter.write()
+
+    then:
+    checkUnresolvedVersions(reporter)
+    checkUpgradeVersions(reporter)
+    checkUpToDateVersions(reporter)
+    checkDowngradeVersions(reporter)
+    checkUndeclaredVersions(reporter)
+
+    where:
+    revision << ['release', 'milestone', 'integration']
+    outputFormat << ['plain', 'json', 'xml']
+  }
+
+  @Unroll
+  def 'Multi-project with dependencies on child (#revision, #outputFormat)'() {
+    given:
+    def (rootProject, childProject) = multiProject()
+    addRepositoryTo(childProject)
+    addDependenciesTo(childProject)
+
+    when:
+    def reporter = evaluate(rootProject, revision, outputFormat)
+    reporter.write()
+
+    then:
+    checkUnresolvedVersions(reporter)
+    checkUpgradeVersions(reporter)
+    checkUpToDateVersions(reporter)
+    checkDowngradeVersions(reporter)
+    checkUndeclaredVersions(reporter)
+
+    where:
+    revision << ['release', 'milestone', 'integration']
+    outputFormat << ['plain', 'json', 'xml']
+  }
+
+  def 'Version ranges are correctly evaluated'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    project.configurations {
+      upToDate
+    }
+    project.dependencies.upToDate 'backport-util-concurrent:backport-util-concurrent:3.+'
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      (upToDateVersions
+        .get(['group': 'backport-util-concurrent', 'name': 'backport-util-concurrent'])
+        .getVersion() == '3.1')
+      downgradeVersions.isEmpty()
+      undeclared.isEmpty()
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/26')
+  def 'Dependencies without versions do not cause a NPE'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    project.configurations {
+      upgradesFound
+    }
+    project.dependencies.upgradesFound 'backport-util-concurrent:backport-util-concurrent'
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      upToDateVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      undeclared.contains(
+        new Coordinate('backport-util-concurrent', 'backport-util-concurrent', NONE_VERSION, null))
+    }
+  }
+
+  def 'Single project with a custom Reporter'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    addDependenciesTo(project)
+    Reporter customReporter = Mock()
+
+    when:
+    def reporter = evaluate(project, 'release', customReporter)
+    reporter.write()
+
+    then:
+    1 * customReporter.write(_) { Result result ->
+      result.current.count == 2
+      result.outdated.count == 2
+      result.exceeded.count == 2
+      result.undeclared.count == 2
+      result.unresolved.count == 2
+    }
+  }
+
+  def 'Single project with an Action<Result> as Reporter'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    addDependenciesTo(project)
+    int current = -1
+    int outdated = -1
+    int exceeded = -1
+    int undeclared = -1
+    int unresolved = -1
+
+    def customReporter = [execute: { result ->
+      current = result.current.count
+      outdated = result.outdated.count
+      exceeded = result.exceeded.count
+      undeclared = result.undeclared.count
+      unresolved = result.unresolved.count
+    }] as Action<Result>
+
+    when:
+    def reporter = evaluate(project, 'release', customReporter)
+    reporter.write()
+
+    then:
+    current == 2
+    outdated == 2
+    exceeded == 2
+    undeclared == 2
+    unresolved == 2
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/844')
+  def 'An unresolved dependency is printed with its project url rather than a version'() {
+    given:
+    def project = singleProject()
+    def projectUrl = 'https://code.google.com/p/google-guice/'
+    def statuses = [
+      new PartialStatus('com.google.inject', 'guice', '2.0', null, '3.1', projectUrl, null),
+      new PartialStatus('com.google.inject', 'guice', '2.0', null, 'none', null,
+        new UnresolvedInfo('com.google.inject', 'guice', '2.0', 'Could not resolve')),
+    ]
+    def unresolved = []
+    def outputFormatter = [execute: { result ->
+      unresolved = result.unresolved.dependencies.toList()
+    }] as Action<Result>
+
+    when:
+    def reporter = reporterFor(statuses, project.path, project.logger, 'milestone',
+      new OutputFormatterArgument.CustomAction(outputFormatter), project.file('build'), 'report',
+      false, 'https://services.gradle.org/versions/', RELEASE_CANDIDATE.id)
+    reporter.write()
+
+    then:
+    unresolved.size() == 1
+    unresolved.first().projectUrl == projectUrl
+  }
+
+  def 'Single project with flatDir repository'() {
+    given:
+    def project = singleProject()
+    project.repositories {
+      flatDir {
+        dirs getClass().getResource('/libs/')
+      }
+    }
+    project.configurations {
+      flat
+    }
+    project.dependencies {
+      flat(name: 'guice-4.0', ext: 'jar')
+      flat(name: 'guava-18.0', ext: 'jar')
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.collectEntries { info ->
+        [['group': info.selectorGroup, 'name': info.selectorName]: info.selectorVersion]
+      } == [['group': '', 'name': 'guava-18.0']: NONE_VERSION]
+      upgradeVersions.isEmpty()
+      upToDateVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      undeclared.contains(new Coordinate('', 'guice-4.0', NONE_VERSION, null))
+    }
+  }
+
+  def 'Single project with configurations scoped dependency versions'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    project.configurations {
+      upToDate
+      exceedLatest
+    }
+    project.dependencies {
+      upToDate 'com.google.guava:guava:16.0'
+      exceedLatest 'com.google.guava:guava:99.0-SNAPSHOT'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      (upToDateVersions.get(['group': 'com.google.guava', 'name': 'guava']).getVersion() ==
+        '16.0')
+      (downgradeVersions.get(['group': 'com.google.guava', 'name': 'guava']).getVersion() ==
+        '99.0-SNAPSHOT')
+      undeclared.isEmpty()
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/475')
+  def 'Single project with a snapshot-only module is reported as up to date'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    project.configurations {
+      upToDate
+    }
+    project.dependencies {
+      upToDate 'com.example:snapshot-only:1.0-SNAPSHOT'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      (upToDateVersions.get(['group': 'com.example', 'name': 'snapshot-only']).getVersion() ==
+        '1.0-SNAPSHOT')
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/475')
+  def 'Single project with a snapshot module having a newer release still shows the upgrade'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    project.configurations {
+      upgradesFound
+    }
+    project.dependencies {
+      upgradesFound 'com.example:snapshot-mixed:1.0-SNAPSHOT'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upToDateVersions.isEmpty()
+      (upgradeVersions.get(['group': 'com.example', 'name': 'snapshot-mixed']).getVersion() ==
+        '1.0-SNAPSHOT')
+      (latestVersions.get(['group': 'com.example', 'name': 'snapshot-mixed']).getVersion() ==
+        '1.5')
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/475')
+  def 'Single project already on the newest snapshot of a mixed module is reported as up to date'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    project.configurations {
+      upToDate
+    }
+    project.dependencies {
+      // No milestone/release candidate exceeds this snapshot, so the module is up to date at it.
+      upToDate 'com.example:snapshot-mixed:2.0-SNAPSHOT'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      downgradeVersions.isEmpty()
+      (upToDateVersions.get(['group': 'com.example', 'name': 'snapshot-mixed']).getVersion() ==
+        '2.0-SNAPSHOT')
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/475')
+  def 'Single project where a snapshot exemption does not extend to another module'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    project.configurations {
+      upToDate
+    }
+    project.dependencies {
+      // snapshot-peer also publishes 1.0.1-SNAPSHOT and 2.0-SNAPSHOT, the latter being the version
+      // snapshot-mixed is exempted at, so neither may be offered as an upgrade of snapshot-peer.
+      upToDate 'com.example:snapshot-peer:1.0'
+      upToDate 'com.example:snapshot-mixed:2.0-SNAPSHOT'
+    }
+
+    when:
+    def reporter = evaluate(project, 'release')
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      (upToDateVersions.get(['group': 'com.example', 'name': 'snapshot-peer']).getVersion() ==
+        '1.0')
+      (upToDateVersions.get(['group': 'com.example', 'name': 'snapshot-mixed']).getVersion() ==
+        '2.0-SNAPSHOT')
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/475')
+  def 'Single project declaring a snapshot-only module dynamically is reported as up to date'() {
+    given:
+    def project = singleProject()
+    addRepositoryTo(project)
+    project.configurations {
+      upToDate
+    }
+    project.dependencies {
+      // The current coordinates record the resolved 1.0-SNAPSHOT rather than the '+' literal, so
+      // the exemption still matches the version the build uses.
+      upToDate 'com.example:snapshot-only:+'
+    }
+
+    when:
+    def reporter = evaluate(project, 'release')
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      (upToDateVersions.get(['group': 'com.example', 'name': 'snapshot-only']).getVersion() ==
+        '1.0-SNAPSHOT')
+    }
+  }
+
+  def 'Single project with annotation processor'() {
+    given:
+    def project = singleProject()
+    project.plugins.apply('java')
+    addRepositoryTo(project)
+    project.dependencies {
+      annotationProcessor 'com.google.guava:guava:99.0-SNAPSHOT'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      upToDateVersions.isEmpty()
+      downgradeVersions[['group': 'com.google.guava', 'name': 'guava']].getVersion() ==
+        '99.0-SNAPSHOT'
+      undeclared.isEmpty()
+    }
+  }
+
+  def 'Single project with component selection rule'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      release
+      all {
+        resolutionStrategy {
+          componentSelection {
+            all { ComponentSelection selection ->
+              if (selection.candidate.version.startsWith('16.')) {
+                selection.reject("Newer than this build accepts")
+              }
+            }
+          }
+        }
+      }
+    }
+    project.dependencies {
+      release 'com.google.guava:guava:15.0'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      (upToDateVersions.get(['group': 'com.google.guava', 'name': 'guava']).getVersion() == '15.0')
+      downgradeVersions.isEmpty()
+      undeclared.isEmpty()
+    }
+  }
+
+  def 'Read project url from pom'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      compile
+    }
+    project.dependencies {
+      compile 'backport-util-concurrent:backport-util-concurrent:3.1'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      projectUrls == [
+        ['group': 'backport-util-concurrent', 'name': 'backport-util-concurrent']: 'https://backport-jsr166.sourceforge.net/'
+      ]
+    }
+  }
+
+  def 'Read project url from direct parent pom'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      compile
+    }
+    project.dependencies {
+      compile 'com.google.inject:guice:3.0'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      projectUrls == [
+        ['group': 'com.google.inject', 'name': 'guice']: 'https://code.google.com/p/google-guice/'
+      ]
+    }
+  }
+
+  def 'Read project url from indirect parent pom'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      compile
+    }
+    project.dependencies {
+      compile 'com.google.inject.extensions:guice-multibindings:3.0'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.isEmpty()
+      projectUrls == [
+        ['group': 'com.google.inject.extensions', 'name': 'guice-multibindings']: 'https://code.google.com/p/google-guice/'
+      ]
+      downgradeVersions.isEmpty()
+      undeclared.isEmpty()
+    }
+  }
+
+  def 'Project url tag in pom does not exist'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      compile
+    }
+    project.dependencies {
+      compile 'backport-util-concurrent:backport-util-concurrent-java12:3.1'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      projectUrls.isEmpty()
+    }
+  }
+
+  def 'Project url of sonatype oss-parent is ignored'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      compile
+    }
+    project.dependencies {
+      compile 'com.google.guava:guava:15.0'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      projectUrls.isEmpty()
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/319')
+  def 'Project url interpolates the project properties'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      compile
+    }
+    project.dependencies {
+      compile 'com.example:interpolated-url:1.0'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      projectUrls == [
+        ['group': 'com.example', 'name': 'interpolated-url']: 'https://example.com/com.example/interpolated-url/1.0'
+      ]
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/758')
+  def 'Project url with an unresolvable placeholder falls back to the parent pom'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      compile
+    }
+    project.dependencies {
+      compile 'com.example:unresolved-url:1.0'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      projectUrls == [
+        ['group': 'com.example', 'name': 'unresolved-url']: 'https://example.com/parent/'
+      ]
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/319')
+  def 'Project url that interpolates to a relative path falls back to the parent pom'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      compile
+    }
+    project.dependencies {
+      compile 'com.example:bare-placeholder-url:1.0'
+    }
+
+    when:
+    def reporter = evaluate(project)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      projectUrls == [
+        ['group': 'com.example', 'name': 'bare-placeholder-url']: 'https://example.com/parent/'
+      ]
+    }
+  }
+
+  def 'Constructor takes gradle release channel'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addRepositoryTo(project)
+    project.configurations {
+      compile
+    }
+    project.dependencies {
+      compile 'com.google.guava:guava:15.0'
+    }
+
+    when:
+    def reporter = evaluate(project, 'milestone', 'plain', 'build', null, null, true, null, CURRENT.id)
+    reporter.write()
+
+    then:
+    with(reporter) {
+      (gradleReleaseChannel == CURRENT.id)
+    }
+  }
+
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/285')
+  def 'checkForGradleUpdate=false does not cause an NPE'() {
+    given:
+    def project = ProjectBuilder.builder().withName('single').build()
+    addDependenciesTo(project)
+
+    when:
+    def reporter = evaluate(project, 'milestone', 'plain', 'build', null, null, false)
+    reporter.write()
+
+    then:
+    noExceptionThrown()
+    with(reporter) {
+      unresolved.size() == 10
+      upgradeVersions.isEmpty()
+      upToDateVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      undeclared.isEmpty()
+    }
+  }
+  @Issue('https://github.com/ben-manes/gradle-versions-plugin/issues/782')
+    def "Allow filtering configurations"() {
+    given:
+    def project = singleProject()
+    addDependenciesTo(project)
+    addRepositoryTo(project)
+
+    when:
+    def reporter = evaluate(project, 'milestone', null, 'build', null, null, false,
+      "", RELEASE_CANDIDATE.id, {config -> (config.name == "upgradesFound") })
+    reporter.write()
+
+    then:
+    with(reporter) {
+      unresolved.isEmpty()
+      upgradeVersions.size() == 2
+      upToDateVersions.isEmpty()
+      downgradeVersions.isEmpty()
+      undeclared.isEmpty()
+    }
+  }
+
+  private static def singleProject() {
+    return ProjectBuilder.builder().withName('single').build()
+  }
+
+  private static def multiProject() {
+    def rootProject = ProjectBuilder.builder().withName('root').build()
+    def childProject = ProjectBuilder.builder().withName('child').withParent(rootProject).build()
+    def leafProject = ProjectBuilder.builder().withName('leaf').withParent(childProject).build()
+    [rootProject, childProject, leafProject]
+  }
+
+  private static def evaluate(project, revision = 'milestone', outputFormatter = null,
+      outputDir = 'build', resolutionStrategy = null, reportfileName = null,
+      checkForGradleUpdate = true, gradleVersionsApiBaseUrl = null,
+      gradleReleaseChannel = RELEASE_CANDIDATE.id, configurationFilter = { true }) {
+    if (reportfileName == null) {
+      reportfileName = "report"
+    }
+    if (gradleVersionsApiBaseUrl == null) {
+      gradleVersionsApiBaseUrl = "https://services.gradle.org/versions/"
+    }
+    ProjectEvaluator.evaluate(project, resolutionStrategy, revision,
+      buildOutputFormatter(outputFormatter), outputDir, reportfileName, checkForGradleUpdate,
+      gradleVersionsApiBaseUrl, gradleReleaseChannel, false, false, configurationFilter)
+  }
+
+  private static OutputFormatterArgument buildOutputFormatter(outputFormatter) {
+    if (outputFormatter instanceof String) {
+      return new OutputFormatterArgument.BuiltIn(outputFormatter)
+    } else if (outputFormatter instanceof Reporter) {
+      return new OutputFormatterArgument.CustomReporter(outputFormatter)
+    } else if (outputFormatter instanceof Action<Result>) {
+      return new OutputFormatterArgument.CustomAction(outputFormatter)
+    } else {
+      return new OutputFormatterArgument.BuiltIn("text")
+    }
+  }
+
+  private void addRepositoryTo(project) {
+    def localMavenRepo = getClass().getResource('/maven/')
+    project.repositories {
+      maven {
+        url localMavenRepo.toURI()
+      }
+    }
+  }
+
+  private static void addEmptyRepositoryTo(project) {
+    project.repositories {
+      maven { url = new File(project.projectDir, 'empty-repository').toURI() }
+    }
+  }
+
+  private static void addDependenciesTo(project) {
+    project.configurations {
+      upToDate
+      exceedLatest
+      upgradesFound
+      undeclared
+      unresolvable
+    }
+    project.dependencies {
+      upToDate('backport-util-concurrent:backport-util-concurrent:3.1') { because 'I said so' }
+      upToDate('backport-util-concurrent:backport-util-concurrent-java12:3.1')
+      exceedLatest('com.google.guava:guava:99.0-SNAPSHOT') { because 'I know the future' }
+      exceedLatest('com.google.guava:guava-tests:99.0-SNAPSHOT')
+      upgradesFound('com.google.inject:guice:2.0') { because 'That\'s just the way it is' }
+      upgradesFound('com.google.inject.extensions:guice-multibindings:2.0')
+      undeclared('com.thoughtworks.xstream:xstream')
+      undeclared('com.jayway.jsonpath:json-path')
+      unresolvable('com.github.ben-manes:unresolvable:1.0') { because 'Life is hard' }
+      unresolvable('com.github.ben-manes:unresolvable2:1.0')
+    }
+  }
+
+  private static void checkUnresolvedVersions(def reporter) {
+    Map<Map<String, String>, UnresolvedInfo> unresolvedMap = reporter.unresolved
+      .collectEntries { info ->
+      [['group': info.selectorGroup, 'name': info.selectorName]: info]
+    }
+    assert reporter.unresolved.size() == 2
+    assert unresolvedMap
+      .get(['group': 'com.github.ben-manes', 'name': 'unresolvable'])
+      .getSelectorVersion() == '+'
+    assert reporter.currentVersions
+      .get(['group': 'com.github.ben-manes', 'name': 'unresolvable'])
+      .getUserReason() == 'Life is hard'
+    assert unresolvedMap
+      .get(['group': 'com.github.ben-manes', 'name': 'unresolvable2'])
+      .getSelectorVersion() == '+'
+  }
+
+  private static void checkUpgradeVersions(def reporter) {
+    assert reporter.upgradeVersions.size() == 2
+    assert reporter.upgradeVersions
+      .get(['group': 'com.google.inject', 'name': 'guice'])
+      .getVersion() == '2.0'
+    assert reporter.upgradeVersions
+      .get(['group': 'com.google.inject', 'name': 'guice'])
+      .getUserReason() == 'That\'s just the way it is'
+    assert reporter.upgradeVersions
+      .get(['group': 'com.google.inject.extensions', 'name': 'guice-multibindings'])
+      .getVersion() == '2.0'
+  }
+
+  private static void checkUpToDateVersions(def reporter) {
+    assert reporter.upToDateVersions.size() == 2
+    assert reporter.upToDateVersions
+      .get(['group': 'backport-util-concurrent', 'name': 'backport-util-concurrent'])
+      .getVersion() == '3.1'
+    assert reporter.upToDateVersions
+      .get(['group': 'backport-util-concurrent', 'name': 'backport-util-concurrent'])
+      .getUserReason() == 'I said so'
+    assert reporter.upToDateVersions
+      .get(['group': 'backport-util-concurrent', 'name': 'backport-util-concurrent-java12'])
+      .getVersion() == '3.1'
+  }
+
+  private static void checkDowngradeVersions(def reporter) {
+    assert reporter.downgradeVersions.size() == 2
+    assert reporter.downgradeVersions
+      .get(['group': 'com.google.guava', 'name': 'guava'])
+      .getVersion() == '99.0-SNAPSHOT'
+    assert reporter.downgradeVersions
+      .get(['group': 'com.google.guava', 'name': 'guava'])
+      .getUserReason() == 'I know the future'
+    assert reporter.downgradeVersions
+      .get(['group': 'com.google.guava', 'name': 'guava-tests'])
+      .getVersion() == '99.0-SNAPSHOT'
+  }
+
+  private static void checkUndeclaredVersions(def reporter) {
+    assert reporter.undeclared.size() == 2
+    assert reporter.undeclared.containsAll([
+      new Coordinate('com.thoughtworks.xstream', 'xstream', NONE_VERSION, null),
+      new Coordinate('com.jayway.jsonpath', 'json-path', NONE_VERSION, null)])
+  }
+}

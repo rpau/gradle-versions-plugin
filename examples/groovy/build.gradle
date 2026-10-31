@@ -1,4 +1,4 @@
-apply plugin: 'com.github.ben-manes.versions'
+apply plugin: 'io.github.ben-manes.versions'
 apply plugin: 'jacoco'
 apply plugin: 'java'
 defaultTasks 'dependencyUpdates'
@@ -7,20 +7,21 @@ buildscript {
   repositories {
     // Use 'gradle install' to install latest
     mavenLocal()
-    jcenter()
+    gradlePluginPortal()
   }
 
   dependencies {
-    classpath 'com.github.ben-manes:gradle-versions-plugin:+'
+    classpath 'io.github.ben-manes:gradle-versions-plugin:+'
   }
 }
 
 repositories {
-  jcenter()
+  mavenCentral()
 }
 
 configurations {
   bom
+  bounded
   upToDate
   exceedLatest
   platform
@@ -32,12 +33,14 @@ configurations {
 
 def isNonStable = { String version ->
   def stableKeyword = ['RELEASE', 'FINAL', 'GA'].any { it -> version.toUpperCase().contains(it) }
-  def regex = /^[0-9,.v-]+(-r)?$/
+  def regex = /^[0-9,.v-]+(-r|-jre|-android)?$/
   return !stableKeyword && !(version ==~ regex)
 }
 
 tasks.named("dependencyUpdates").configure {
   checkForGradleUpdate = true
+  rejectOutOfBounds = true
+  rejectPreReleases = false
 
   // Example 1: reject all non stable versions
   rejectVersionIf {
@@ -59,15 +62,30 @@ tasks.named("dependencyUpdates").configure {
       }
     }
   }
+
+  // Example 4: disallow candidates less mature than the current version
+  def qualifiers = ['preview', 'alpha', 'beta', 'm', 'cr', 'rc'] // order is important
+  def maturityLevel = { String version ->
+    def index = qualifiers.findIndexOf { version ==~ /(?i).*[.\-]$it[.\-\d]*/ }
+    return (index < 0) ? qualifiers.size() : index
+  }
+  rejectVersionIf {
+    maturityLevel(candidate.version) < maturityLevel(currentVersion)
+  }
 }
 
 dependencies {
   bom 'org.springframework.boot:spring-boot-dependencies:1.5.8.RELEASE',
       'com.google.code.gson:gson',
       'dom4j:dom4j'
+  bounded('com.google.code.gson:gson') {
+    version {
+      strictly '[2.8, 2.11['
+    }
+  }
   upToDate 'backport-util-concurrent:backport-util-concurrent:3.1',
            'backport-util-concurrent:backport-util-concurrent-java12:3.1',
-	    'org.openjdk.jmh:jmh-parent:1.25.2'
+           'org.openjdk.jmh:jmh-parent:1.25.2'
   exceedLatest 'com.google.guava:guava:99.0-SNAPSHOT',
                'com.google.guava:guava-tests:99.0-SNAPSHOT'
   upgradesFound 'com.google.guava:guava:15.0',

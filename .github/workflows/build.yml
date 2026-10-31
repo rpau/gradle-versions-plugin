@@ -1,9 +1,27 @@
 name: build
 
-on: [ push, pull_request ]
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+  pull_request:
+    types: [ opened, labeled, unlabeled, synchronize ]
+    paths-ignore:
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+  workflow_call:
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
 
 jobs:
+  # The wrapper runs on the newest JDK, and the toolchain task forks the test worker onto the row's
+  # JDK, which the TestKit daemons then start on. JDK 8 compiles the specs for the rows below 17.
   jvm:
+    name: Test on JDK ${{ matrix.java-version }}
     runs-on: ubuntu-latest
 
     strategy:
@@ -12,28 +30,148 @@ jobs:
         java-version:
           - 8
           - 11
+          - 17
+          - 21
+
+    permissions:
+      checks: write
+      pull-requests: write
 
     steps:
       - name: Checkout Project
-        uses: actions/checkout@v3
-
-      - name: Validate Gradle Wrapper
-        uses: gradle/wrapper-validation-action@v1
+        uses: actions/checkout@v7
 
       - name: Configure JDK
-        uses: actions/setup-java@v2
+        uses: actions/setup-java@v6
         with:
-          distribution: 'adopt'
-          java-version: ${{ matrix.java-version }}
+          distribution: temurin
+          java-version: |
+            8
+            ${{ matrix.java-version }}
+            25
 
-      - name: Run build with caching enabled
-        uses: burrunan/gradle-cache-action@v1.10
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
         with:
-          remote-build-cache-proxy-enabled: false
-          arguments: clean build -s --scan
+          cache-provider: enhanced
+
+      - name: Run the suite on JDK ${{ matrix.java-version }}
+        run: ./gradlew testOn${{ matrix.java-version }} -s
+
+      - name: Publish Test Report
+        uses: EnricoMi/publish-unit-test-result-action@v2.24.0
+        if: always()
+        with:
+          comment_mode: off
+          action_fail_on_inconclusive: true
+          files: '**/build/test-results/*/TEST-*.xml'
 
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gradle-versions-plugin-${{ matrix.java-version }}-${{ github.workflow }}-${{ github.run_id }}
+          path: |
+            build/reports
+            build/test-results
+          if-no-files-found: warn
+
+  windows:
+    name: Test on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Project
+        uses: actions/checkout@v7
+
+      - name: Configure JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: enhanced
+
+      - name: Run the suite
+        run: ./gradlew test -s
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gradle-versions-plugin-windows-${{ github.workflow }}-${{ github.run_id }}
+          path: |
+            build/reports
+            gradle-versions-plugin/build/test-results
+          if-no-files-found: warn
+
+  build:
+    name: Build and test on JDK 25, and run the examples
+    runs-on: ubuntu-latest
+
+    permissions:
+      checks: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout Project
+        uses: actions/checkout@v7
+
+      # The examples are separate roots without the daemon criteria this build pins, so their
+      # launcher is what the Gradle they run on starts with: 21 for the minimum, 25 for the wrapper.
+      - name: Configure JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: |
+            21
+            25
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: enhanced
+
+      # The JDK 8 row of the matrix runs the leg that `check` adds.
+      - name: Run build with caching enabled
+        run: ./gradlew clean build -x testOn8 -s
+
+      - name: Publish Test Report
+        uses: EnricoMi/publish-unit-test-result-action@v2.24.0
+        if: always()
+        with:
+          comment_mode: off
+          action_fail_on_inconclusive: true
+          files: '**/build/test-results/*/TEST-*.xml'
+
+      - name: Run examples
+        run: |
+          export VERSION_NAME=$(cat gradle.properties | grep -w "VERSION_NAME" | cut -d'=' -f2)
+          rm -rf ~/.m2/repository/io/github/ben-manes/gradle-versions-plugin/$VERSION_NAME
+          ./gradlew publishToMavenLocal -x test -s
+          cat ~/.m2/repository/io/github/ben-manes/gradle-versions-plugin/$VERSION_NAME/gradle-versions-plugin-$VERSION_NAME.pom
+          cd examples/groovy/ && ../../gradlew dU && cd -
+          cd examples/kotlin/ && ../../gradlew dU && cd -
+
+      # The wrapper pins the examples to the latest Gradle, so the samples are run against the
+      # minimum supported release as well, on a JDK that release starts on.
+      # https://github.com/ben-manes/gradle-versions-plugin/issues/941
+      - name: Provision Gradle 8.4
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.4'
+
+      - name: Run examples on Gradle 8.4
+        run: |
+          export JAVA_HOME=$JAVA_HOME_21_X64
+          cd examples/groovy/ && gradle dU && cd -
+          cd examples/kotlin/ && gradle dU && cd -
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: gradle-versions-plugin-${{ github.workflow }}-${{ github.run_id }}
